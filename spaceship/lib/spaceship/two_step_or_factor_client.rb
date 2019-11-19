@@ -1,8 +1,24 @@
 require_relative 'globals'
 require_relative 'tunes/tunes_client'
+require 'google/apis/gmail_v1'
+require 'googleauth'
+require 'googleauth/stores/file_token_store'
+require 'fileutils'
+require 'date'
+
+
 
 module Spaceship
   class Client
+    OOB_URI = 'urn:ietf:wg:oauth:2.0:oob'.freeze
+    APPLICATION_NAME = 'Gmail API Ruby Quickstart'.freeze
+    CREDENTIALS_PATH = 'credentials.json'.freeze
+# The file token.yaml stores the user's access and refresh tokens, and is
+# created automatically when the authorization flow completes for the first
+# time.
+    TOKEN_PATH = 'token.yaml'.freeze
+    SCOPE = Google::Apis::GmailV1::AUTH_GMAIL_READONLY
+
     def handle_two_step_or_factor(response)
       # extract `x-apple-id-session-id` and `scnt` from response, to be used by `update_request_headers`
       @x_apple_id_session_id = response["x-apple-id-session-id"]
@@ -36,7 +52,7 @@ module Spaceship
       available = response.body["trustedDevices"].collect do |current|
         "#{current['name']}\t#{current['modelName'] || 'SMS'}\t(#{current['id']})"
       end
-      result = choose(*available)
+      result = available[0]
 
       device_id = result.match(/.*\t.*\t\((.*)\)/)[1]
       handle_two_step_for_device(device_id)
@@ -55,49 +71,54 @@ module Spaceship
       Spaceship::TunesClient.new.handle_itc_response(r.body)
 
       puts("Successfully requested notification")
-      code = ask("Please enter the 4 digit code: ")
-      puts("Requesting session...")
+      code = get_code
+      if code
+        puts("Requesting session...")
 
-      # Send token to server to get a valid session
-      r = request(:post) do |req|
-        req.url("https://idmsa.apple.com/appleauth/auth/verify/device/#{device_id}/securitycode")
-        req.headers['Content-Type'] = 'application/json'
-        req.body = { "code" => code.to_s }.to_json
-        update_request_headers(req)
-      end
-
-      begin
-        Spaceship::TunesClient.new.handle_itc_response(r.body) # this will fail if the code is invalid
-      rescue => ex
-        # If the code was entered wrong
-        # {
-        #   "securityCode": {
-        #     "code": "1234"
-        #   },
-        #   "securityCodeLocked": false,
-        #   "recoveryKeyLocked": false,
-        #   "recoveryKeySupported": true,
-        #   "manageTrustedDevicesLinkName": "appleid.apple.com",
-        #   "suppressResend": false,
-        #   "authType": "hsa",
-        #   "accountLocked": false,
-        #   "validationErrors": [{
-        #     "code": "-21669",
-        #     "title": "Incorrect Verification Code",
-        #     "message": "Incorrect verification code."
-        #   }]
-        # }
-        if ex.to_s.include?("verification code") # to have a nicer output
-          puts("Error: Incorrect verification code")
-          return handle_two_step_for_device(device_id)
+        # Send token to server to get a valid session
+        r = request(:post) do |req|
+          req.url("https://idmsa.apple.com/appleauth/auth/verify/device/#{device_id}/securitycode")
+          req.headers['Content-Type'] = 'application/json'
+          req.body = { "code" => code.to_s }.to_json
+          update_request_headers(req)
         end
 
-        raise ex
+        begin
+          Spaceship::TunesClient.new.handle_itc_response(r.body) # this will fail if the code is invalid
+        rescue => ex
+          # If the code was entered wrong
+          # {
+          #   "securityCode": {
+          #     "code": "1234"
+          #   },
+          #   "securityCodeLocked": false,
+          #   "recoveryKeyLocked": false,
+          #   "recoveryKeySupported": true,
+          #   "manageTrustedDevicesLinkName": "appleid.apple.com",
+          #   "suppressResend": false,
+          #   "authType": "hsa",
+          #   "accountLocked": false,
+          #   "validationErrors": [{
+          #     "code": "-21669",
+          #     "title": "Incorrect Verification Code",
+          #     "message": "Incorrect verification code."
+          #   }]
+          # }
+          if ex.to_s.include?("verification code") # to have a nicer output
+            puts("Error: Incorrect verification code")
+            return handle_two_step_for_device(device_id)
+          end
+
+          raise ex
+        end
+
+        store_session
+
+        return true
+      else
+        puts "Failed to get code."
+        return false
       end
-
-      store_session
-
-      return true
     end
 
     def handle_two_factor(response, depth = 0)
@@ -123,7 +144,7 @@ module Spaceship
       code_length = security_code["length"]
 
       puts("")
-      env_2fa_sms_default_phone_number = ENV["SPACESHIP_2FA_SMS_DEFAULT_PHONE_NUMBER"]
+      env_2fa_sms_default_phone_number = 4844024191
 
       if env_2fa_sms_default_phone_number
         raise Tunes::Error.new, "Environment variable SPACESHIP_2FA_SMS_DEFAULT_PHONE_NUMBER is set, but empty." if env_2fa_sms_default_phone_number.empty?
@@ -135,21 +156,6 @@ module Spaceship
         phone_id = phone_id_from_number(response.body["trustedPhoneNumbers"], phone_number)
         code_type = 'phone'
         body = request_two_factor_code_from_phone(phone_id, phone_number, code_length)
-      else
-        puts("(Input `sms` to escape this prompt and select a trusted phone number to send the code as a text message)")
-        puts("")
-        puts("(You can also set the environment variable `SPACESHIP_2FA_SMS_DEFAULT_PHONE_NUMBER` to automate this)")
-        puts("(Read more at: https://github.com/fastlane/fastlane/blob/master/spaceship/docs/Authentication.md#auto-select-sms-via-spaceship-2fa-sms-default-phone-number)")
-        puts("")
-        code_type = 'trusteddevice'
-        code = ask_for_2fa_code("Please enter the #{code_length} digit code:")
-        body = { "securityCode" => { "code" => code.to_s } }.to_json
-
-        # User exited by entering `sms` and wants to choose phone number for SMS
-        if code == 'sms'
-          code_type = 'phone'
-          body = request_two_factor_code_from_phone_choose(response.body["trustedPhoneNumbers"], code_length)
-        end
       end
 
       puts("Requesting session...")
@@ -247,7 +253,7 @@ If it is, please open an issue at https://github.com/fastlane/fastlane/issues/ne
       available = phone_numbers.collect do |current|
         current['numberWithDialCode']
       end
-      chosen = choose(*available)
+      chosen = available[0]
       phone_id = phone_id_from_masked_number(phone_numbers, chosen)
 
       request_two_factor_code_from_phone(phone_id, chosen, code_length)
@@ -269,7 +275,7 @@ If it is, please open an issue at https://github.com/fastlane/fastlane/issues/ne
 
       puts("Successfully requested text message to #{phone_number}")
 
-      code = ask_for_2fa_code("Please enter the #{code_length} digit code you received at #{phone_number}:")
+      code = get_code
 
       return { "securityCode" => { "code" => code.to_s }, "phoneNumber" => { "id" => phone_id }, "mode" => "sms" }.to_json
     end
@@ -306,5 +312,81 @@ If it is, please open an issue at https://github.com/fastlane/fastlane/issues/ne
       req.headers["Accept"] = "application/json"
       req.headers["scnt"] = @scnt
     end
+
+    def authorize
+      client_id = Google::Auth::ClientId.from_file(CREDENTIALS_PATH)
+      token_store = Google::Auth::Stores::FileTokenStore.new(file: TOKEN_PATH)
+      authorizer = Google::Auth::UserAuthorizer.new(client_id, SCOPE, token_store)
+      user_id = 'default'
+      credentials = authorizer.get_credentials(user_id)
+      if credentials.nil?
+        url = authorizer.get_authorization_url(base_url: OOB_URI)
+        puts 'Open the following URL in the browser and enter the ' \
+         "resulting code after authorization:\n" + url
+        code = gets
+        credentials = authorizer.get_and_store_credentials_from_code(
+            user_id: user_id, code: code, base_url: OOB_URI
+        )
+      end
+      credentials
+    end
+
+    def get_code
+      # Initialize the API
+      # API must be enabled for gmail acocunt - https://developers.google.com/classroom/quickstart/ruby
+      # Add credentials.json to auto directory
+      # First login - open link in console, get code and enter in console to autheniticat
+      service = Google::Apis::GmailV1::GmailService.new
+      service.client_options.application_name = APPLICATION_NAME
+      service.authorization = authorize
+
+      # Show the user's labels
+
+      sleep(15)
+
+      puts "Reading Email"
+      user_id = 'me'
+      result = service.list_user_labels(user_id)
+
+      maxAttempts = 2
+      i = 0
+      isCode = false
+      now = DateTime.now()
+      now = (now.to_time - 40).to_datetime
+
+      while (isCode == false && i < maxAttempts)
+        puts "Waiting for code email"
+        i += 1
+
+        message = service.list_user_messages(user_id)
+        id = message.messages[0].id
+
+        result = service.get_user_message(user_id, id)
+        payload = result.payload
+        headers = payload.headers
+
+        date = headers.any? { |h| h.name == 'Date' } ? headers.find { |h| h.name == 'Date' }.value : ''
+        subject = headers.any? { |h| h.name == 'Subject' } ? headers.find { |h| h.name == 'Subject' }.value : ''
+        body = payload.body
+        emailDate = DateTime.rfc2822(date)
+
+        if (now < emailDate && subject.include?("New text message from"))
+          isCode = true
+          jsonObj = JSON.parse(result.to_json)
+          messageBody = jsonObj['snippet']
+          str1_markerstring = "Code is: "
+          str2_markerstring = " "
+          code = messageBody[/#{str1_markerstring}(.*?)#{str2_markerstring}/m, 1]
+          puts jsonObj['snippet']
+          return code
+        else
+          now = DateTime.now()
+          sleep(20)
+        end
+      end
+
+      return false
+    end
+
   end
 end
